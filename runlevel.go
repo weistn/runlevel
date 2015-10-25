@@ -12,10 +12,14 @@ type FilterFunc func(key, value []byte) []byte
 
 // Returns true if the task has been completed, or false otherwise.
 // In the case of false, an entry is written to the DB to note that this task still needs doing.
-type TaskFunc func(key, value []byte, hook *sublevel.Hook) bool
+type TaskPreFunc func(key, value []byte, hook *sublevel.Hook) bool
+type TaskPostFunc func(key, value []byte)
 
 type taskState struct {
+	// A negative value means that a computation is running and has not yet committed to disk.
 	n int
+	// Used by TriggerAfter only
+	tainted bool
 	time int64
 }
 
@@ -23,24 +27,27 @@ type Task struct {
 	db *sublevel.DB
 	name string
 	filter FilterFunc
-	task TaskFunc
+	taskPreFunc TaskPreFunc
+	taskPostFunc TaskPostFunc
 	taskDb *sublevel.DB
 	wo *levigo.WriteOptions
 	ro *levigo.ReadOptions
 	running map[string]taskState
 	runningMutex sync.Mutex
 	closeMutex sync.Mutex
+	pre sublevel.PreFunc
+	post sublevel.PostFunc
 }
 
-func RunBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskFunc) *Task {
+func TriggerBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskPreFunc) *Task {
 	// Create a sublevel to store all tasks that need doing
 	taskDb := sublevel.Sublevel(db.LevelDB(), name)
 	wo := levigo.NewWriteOptions()
 	ro := levigo.NewReadOptions()
-	task := &Task{db: db, name: name, filter: filter, task: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
+	task := &Task{db: db, name: name, filter: filter, taskPreFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
 
 	// Hook into the db to watch for changes
-	db.Pre(func(key, value []byte, hook *sublevel.Hook) {
+	task.pre = func(key, value []byte, hook *sublevel.Hook) {
 //		println("PRE", string(key), string(value))
 		// Is this change relevant?
 		taskKey := filter(key, value)
@@ -58,14 +65,14 @@ func RunBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskFun
 				// Write a DB row so the task is not forgotten if the system is terminated now
 				nowBytes := []byte(fmt.Sprintf("%d", now))
 				taskDb.Put(wo, append(taskKey, nowBytes...), key)
-				task.running[string(taskKey)] = taskState{2,now}
+				task.running[string(taskKey)] = taskState{2, false, now}
 			} else {
-				task.running[string(taskKey)] = taskState{state.n + 1, state.time}
+				task.running[string(taskKey)] = taskState{state.n + 1, false, state.time}
 			}
 			task.runningMutex.Unlock()
 			return
 		} else {
-			task.running[string(taskKey)] = taskState{-1, now}
+			task.running[string(taskKey)] = taskState{-1, false, now}
 		}
 		task.runningMutex.Unlock()
 
@@ -77,9 +84,9 @@ func RunBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskFun
 			nowBytes := []byte(fmt.Sprintf("%d", now))
 			hook.Put(append(taskKey, nowBytes...), key, taskDb)
 		}
-	})
+	}
 
-	db.Post(func(key, value []byte, hook *sublevel.Hook) {
+	task.post = func(key, value []byte) {
 //		println("POST", string(key), string(value))
 		// Is this change relevant?
 		taskKey := filter(key, value)
@@ -92,7 +99,7 @@ func RunBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskFun
 		if state.n == -1 || state.n == 1 {
 			delete(task.running, string(taskKey))
 		} else {
-			task.running[string(taskKey)] = taskState{state.n - 1, state.time}				
+			task.running[string(taskKey)] = taskState{state.n - 1, false, state.time}				
 		}
 		task.runningMutex.Unlock()
 
@@ -105,12 +112,107 @@ func RunBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskFun
 			if err != nil {
 				return
 			}
-			db.Simulate(wo, key, val)
+			db.RunHook(wo, task.pre, task.post, key, val)
 			// Delete the DB row, because all pending tasks for this key have been executed.
 			nowBytes := []byte(fmt.Sprintf("%d", state.time))
 			taskDb.Delete(wo, append(taskKey, nowBytes...))
 		}
-	})
+	}
+
+	db.Pre(task.pre)
+	db.Post(task.post)
+
+	return task
+}
+
+func TriggerAfter(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskPostFunc) *Task {
+	// Create a sublevel to store all tasks that need doing
+	taskDb := sublevel.Sublevel(db.LevelDB(), name)
+	wo := levigo.NewWriteOptions()
+	ro := levigo.NewReadOptions()
+	task := &Task{db: db, name: name, filter: filter, taskPostFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
+
+	var run func(key, value, taskKey []byte)
+	run = func(key, value, taskKey []byte) {
+		hookfunc := func(key, value []byte, hook *sublevel.Hook) {
+			taskfunc(key, value)
+		}
+		// Execute taskfunc in the context of a new hook, commit to disk, then call after
+		db.RunHook(wo, hookfunc, nil, key, value)
+
+		task.runningMutex.Lock()
+		state := task.running[string(taskKey)]
+		nowBytes := []byte(fmt.Sprintf("%d", state.time))
+		if state.tainted {
+			task.running[string(taskKey)] = taskState{state.n, false, state.time}
+			val, err := db.Get(ro, key)
+			if err != nil {
+				return
+			}
+//			println("Running tainted", string(key), string(val))
+			task.runningMutex.Unlock()
+			go run(key, val, taskKey)
+			return
+		} else if state.n == -1 {
+			delete(task.running, string(taskKey))
+		} else {
+			task.running[string(taskKey)] = taskState{state.n, false, state.time}	
+		}
+		task.runningMutex.Unlock()
+
+		if state.n == -1 {
+			taskDb.Delete(wo, append(taskKey, nowBytes...))
+		}
+	}
+
+	// Hook into the db to watch for changes
+	task.pre = func(key, value []byte, hook *sublevel.Hook) {
+//		println("PRE", string(key), string(value))
+		// Is this change relevant?
+		taskKey := filter(key, value)
+		if taskKey == nil {
+			return
+		}
+		task.runningMutex.Lock()
+		defer task.runningMutex.Unlock()
+		now := time.Now().Unix()
+		if state, ok := task.running[string(taskKey)]; ok {
+			if state.n < 0 {
+				task.running[string(taskKey)] = taskState{state.n - 1, false, state.time}
+			} else {
+				task.running[string(taskKey)] = taskState{state.n + 1, false, state.time}					
+			}
+		} else {
+			// Write a DB row so the task is not forgotten if the system is terminated now
+			nowBytes := []byte(fmt.Sprintf("%d", now))
+			taskDb.Put(wo, append(taskKey, nowBytes...), key)
+			task.running[string(taskKey)] = taskState{2, false, now}
+		}
+	}
+
+	task.post = func(key, value []byte) {
+//		println("POST", string(key), string(value))
+		// Is this change relevant?
+		taskKey := filter(key, value)
+		if taskKey == nil {
+			return
+		}
+
+		task.runningMutex.Lock()
+		state := task.running[string(taskKey)]
+		if state.n == 2 {
+			task.running[string(taskKey)] = taskState{-1, state.tainted, state.time}
+			go run(key, value, taskKey)
+		} else if state.n < 0 {
+			task.running[string(taskKey)] = taskState{state.n + 1, true, state.time}				
+		} else {
+			task.running[string(taskKey)] = taskState{state.n - 1, state.tainted, state.time}
+		}
+		task.runningMutex.Unlock()
+	}
+
+	db.Pre(task.pre)
+	db.Post(task.post)
 
 	return task
 }
@@ -127,7 +229,7 @@ func (this *Task) WorkOff() (err error) {
 		if err != nil {
 			continue
 		}
-		err = this.db.Simulate(wo, it.Value(), val)
+		err = this.db.RunHook(wo, this.pre, this.post, it.Value(), val)
 		if err != nil {
 			return
 		}
