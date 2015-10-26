@@ -25,7 +25,6 @@ type taskState struct {
 
 type Task struct {
 	db *sublevel.DB
-	name string
 	filter FilterFunc
 	taskPreFunc TaskPreFunc
 	taskPostFunc TaskPostFunc
@@ -39,12 +38,10 @@ type Task struct {
 	post sublevel.PostFunc
 }
 
-func TriggerBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskPreFunc) *Task {
-	// Create a sublevel to store all tasks that need doing
-	taskDb := sublevel.Sublevel(db.LevelDB(), name)
+func TriggerBefore(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, taskfunc TaskPreFunc) *Task {
 	wo := levigo.NewWriteOptions()
 	ro := levigo.NewReadOptions()
-	task := &Task{db: db, name: name, filter: filter, taskPreFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
+	task := &Task{db: db, filter: filter, taskPreFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
 
 	// Hook into the db to watch for changes
 	task.pre = func(key, value []byte, hook *sublevel.Hook) {
@@ -125,12 +122,10 @@ func TriggerBefore(db *sublevel.DB, name string, filter FilterFunc, taskfunc Tas
 	return task
 }
 
-func TriggerAfter(db *sublevel.DB, name string, filter FilterFunc, taskfunc TaskPostFunc) *Task {
-	// Create a sublevel to store all tasks that need doing
-	taskDb := sublevel.Sublevel(db.LevelDB(), name)
+func TriggerAfter(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, taskfunc TaskPostFunc) *Task {
 	wo := levigo.NewWriteOptions()
 	ro := levigo.NewReadOptions()
-	task := &Task{db: db, name: name, filter: filter, taskPostFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
+	task := &Task{db: db, filter: filter, taskPostFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
 
 	var run func(key, value, taskKey []byte)
 	run = func(key, value, taskKey []byte) {

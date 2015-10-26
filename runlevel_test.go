@@ -24,6 +24,7 @@ func TestRunlevel(t *testing.T) {
 
 	sub1 := sublevel.Sublevel(db, "input")
 	index := sublevel.Sublevel(db, "index")
+	job := sublevel.Sublevel(db, "job")
 
 	sub1.Post(func(key, value []byte) {
 		time.Sleep(1000 * time.Millisecond)
@@ -31,7 +32,7 @@ func TestRunlevel(t *testing.T) {
 
 	var delay = false
 
-	task := TriggerBefore(sub1, "job", func(key, value []byte) []byte {
+	task := TriggerBefore(sub1, job, func(key, value []byte) []byte {
 		if strings.HasPrefix(string(key), "Doc_") || strings.HasPrefix(string(key), "PostDoc_") {
 			return key
 		}
@@ -108,10 +109,11 @@ func TestRunlevel2(t *testing.T) {
 
 	sub1 := sublevel.Sublevel(db, "input")
 	index := sublevel.Sublevel(db, "index")
+	job := sublevel.Sublevel(db, "job")
 
 	runcount := 0
 
-	task := TriggerAfter(sub1, "job", func(key, value []byte) []byte {
+	task := TriggerAfter(sub1, job, func(key, value []byte) []byte {
 		if strings.HasPrefix(string(key), "Doc_") || strings.HasPrefix(string(key), "PostDoc_") {
 			return key
 		}
