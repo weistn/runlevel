@@ -111,15 +111,12 @@ func TestRunlevel2(t *testing.T) {
 	index := sublevel.Sublevel(db, "index")
 	job := sublevel.Sublevel(db, "job")
 
-	runcount := 0
-
 	task := TriggerAfter(sub1, job, func(key, value []byte) []byte {
-		if strings.HasPrefix(string(key), "Doc_") || strings.HasPrefix(string(key), "PostDoc_") {
+		if strings.HasPrefix(string(key), "Doc_") {
 			return key
 		}
 		return nil
 	}, func(key, value []byte) {
-		runcount++
 		doc := make(map[string]string)
 		err := json.Unmarshal(value, &doc)
 		if err != nil {
@@ -143,9 +140,6 @@ func TestRunlevel2(t *testing.T) {
 
 	time.Sleep(800 * time.Millisecond)
 
-	if runcount != 2 {
-		t.Fatal(runcount)		
-	}
 
 	val, err = index.Get(ro, []byte("01234"))
 	if err != nil || string(val) != "43" {

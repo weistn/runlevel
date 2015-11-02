@@ -3,9 +3,10 @@ package runlevel
 import (
 	"github.com/jmhodges/levigo"
 	"github.com/weistn/sublevel"
+	"github.com/weistn/uniclock"
 	"fmt"
-	"time"
 	"sync"
+	"bytes"
 )
 
 type FilterFunc func(key, value []byte) []byte
@@ -56,12 +57,12 @@ func TriggerBefore(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, task
 		// However, it is fine if this function is executed in multiple go-routines, since the output of the task is written
 		// atomically with the data is has been working on. So 'last-write-wins' is perfectly ok.
 		task.runningMutex.Lock()
-		now := time.Now().Unix()
+		now := uniclock.Next()
 		if state, ok := task.running[string(taskKey)]; ok {
 			if state.n == -1 {
 				// Write a DB row so the task is not forgotten if the system is terminated now
-				nowBytes := []byte(fmt.Sprintf("%d", now))
-				taskDb.Put(wo, append(taskKey, nowBytes...), key)
+				nowBytes := []byte(fmt.Sprintf("%016x", now))
+				hook.Put(append(taskKey, nowBytes...), key, taskDb)
 				task.running[string(taskKey)] = taskState{2, false, now}
 			} else {
 				task.running[string(taskKey)] = taskState{state.n + 1, false, state.time}
@@ -77,8 +78,8 @@ func TriggerBefore(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, task
 		done := taskfunc(key, value, hook)
 		if !done {
 			// Add a row to the DB that marks this task as 'needs-to-be-executed-later'.
-			now := time.Now().Unix()
-			nowBytes := []byte(fmt.Sprintf("%d", now))
+			now := uniclock.Next()
+			nowBytes := []byte(fmt.Sprintf("%016x", now))
 			hook.Put(append(taskKey, nowBytes...), key, taskDb)
 		}
 	}
@@ -101,8 +102,8 @@ func TriggerBefore(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, task
 		task.runningMutex.Unlock()
 
 		if state.n == 1 {
-			// There have been multiple interleaving invokations of the task from concurrent transactions.
-			// The first invokation caused the TaskFunc to execute, but most likely on old data.
+			// There have been multiple interleaving invocations of the task from concurrent transactions.
+			// The first invocation caused the TaskFunc to execute, but most likely on old data.
 			// This is the last of these transactions that has completed.
 			// The task has to be re-run for the key to compute it based on the latest data.
 			val, err := db.Get(ro, key)
@@ -111,7 +112,7 @@ func TriggerBefore(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, task
 			}
 			db.RunHook(wo, task.pre, task.post, key, val)
 			// Delete the DB row, because all pending tasks for this key have been executed.
-			nowBytes := []byte(fmt.Sprintf("%d", state.time))
+			nowBytes := []byte(fmt.Sprintf("%016x", state.time))
 			taskDb.Delete(wo, append(taskKey, nowBytes...))
 		}
 	}
@@ -127,26 +128,41 @@ func TriggerAfter(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, taskf
 	ro := levigo.NewReadOptions()
 	task := &Task{db: db, filter: filter, taskPostFunc: taskfunc, taskDb: taskDb, wo: wo, ro: ro, running: make(map[string]taskState)}
 
-	var run func(key, value, taskKey []byte)
-	run = func(key, value, taskKey []byte) {
+	var run func(taskKey []byte)
+	run = func(taskKey []byte) {
+//		println("RUN", string(key), string(value), string(taskKey))
 		hookfunc := func(key, value []byte, hook *sublevel.Hook) {
 			taskfunc(key, value)
 		}
-		// Execute taskfunc in the context of a new hook, commit to disk, then call after
-		db.RunHook(wo, hookfunc, nil, key, value)
+
+		it := task.taskDb.NewIterator(task.ro)
+		for it.Seek(taskKey); it.Valid(); it.Next() {
+			if !bytes.HasPrefix(it.Key(), taskKey) || len(taskKey) + 16 != len(it.Key()) {
+				break
+			}
+			val, err := task.db.Get(task.ro, it.Value())
+			if err != nil {
+				continue
+			}
+			println("RUN", string(it.Value()), string(val), string(taskKey))
+			// Execute taskfunc in the context of a new hook, commit to disk, then call after
+			db.RunHook(wo, hookfunc, nil, it.Value(), val)
+			taskDb.Delete(wo, it.Key())
+		}
+		it.Close()
 
 		task.runningMutex.Lock()
 		state := task.running[string(taskKey)]
-		nowBytes := []byte(fmt.Sprintf("%d", state.time))
+//		nowBytes := []byte(fmt.Sprintf("%016x", state.time))
 		if state.tainted {
 			task.running[string(taskKey)] = taskState{state.n, false, state.time}
-			val, err := db.Get(ro, key)
-			if err != nil {
-				return
-			}
+//			val, err := db.Get(ro, key)
+//			if err != nil {
+//				return
+//			}
 //			println("Running tainted", string(key), string(val))
 			task.runningMutex.Unlock()
-			go run(key, val, taskKey)
+			go run(taskKey)
 			return
 		} else if state.n == -1 {
 			delete(task.running, string(taskKey))
@@ -155,22 +171,29 @@ func TriggerAfter(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, taskf
 		}
 		task.runningMutex.Unlock()
 
-		if state.n == -1 {
-			taskDb.Delete(wo, append(taskKey, nowBytes...))
-		}
+//		if state.n == -1 {
+//			taskDb.Delete(wo, append(taskKey, nowBytes...))
+//		}
 	}
 
 	// Hook into the db to watch for changes
 	task.pre = func(key, value []byte, hook *sublevel.Hook) {
-//		println("PRE", string(key), string(value))
+		println("PRE", string(key), string(value))
 		// Is this change relevant?
 		taskKey := filter(key, value)
 		if taskKey == nil {
 			return
 		}
+		println("PREtask", "'" + string(taskKey) + "'")
 		task.runningMutex.Lock()
 		defer task.runningMutex.Unlock()
-		now := time.Now().Unix()
+
+		// Write a DB row so the task is not forgotten if the system is terminated now
+		now := uniclock.Next()
+		nowBytes := []byte(fmt.Sprintf("%016x", now))
+		hook.Put(append(taskKey, nowBytes...), key, taskDb)
+
+		// Take note that we need to execute under the given taskKey
 		if state, ok := task.running[string(taskKey)]; ok {
 			if state.n < 0 {
 				task.running[string(taskKey)] = taskState{state.n - 1, false, state.time}
@@ -178,26 +201,24 @@ func TriggerAfter(db *sublevel.DB, taskDb *sublevel.DB, filter FilterFunc, taskf
 				task.running[string(taskKey)] = taskState{state.n + 1, false, state.time}					
 			}
 		} else {
-			// Write a DB row so the task is not forgotten if the system is terminated now
-			nowBytes := []byte(fmt.Sprintf("%d", now))
-			taskDb.Put(wo, append(taskKey, nowBytes...), key)
 			task.running[string(taskKey)] = taskState{2, false, now}
 		}
 	}
 
 	task.post = func(key, value []byte) {
-//		println("POST", string(key), string(value))
+		println("POST", string(key), string(value))
 		// Is this change relevant?
 		taskKey := filter(key, value)
 		if taskKey == nil {
 			return
 		}
 
+		println("POSTtask", "'" + string(taskKey) + "'")
 		task.runningMutex.Lock()
 		state := task.running[string(taskKey)]
 		if state.n == 2 {
 			task.running[string(taskKey)] = taskState{-1, state.tainted, state.time}
-			go run(key, value, taskKey)
+			go run(taskKey)
 		} else if state.n < 0 {
 			task.running[string(taskKey)] = taskState{state.n + 1, true, state.time}				
 		} else {
